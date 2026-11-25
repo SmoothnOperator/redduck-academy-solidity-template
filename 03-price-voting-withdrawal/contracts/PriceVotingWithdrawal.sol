@@ -4,61 +4,115 @@ pragma solidity 0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 // ============================================================================
-// PriceVotingWithdrawal
+// PriceVotingWithdrawal (O(1) Optimistic Claim-and-Challenge Design)
 // ============================================================================
 //
-// Token holders lock tokens behind any proposed uint256 price. Voters can
-// withdraw their locked tokens at ANY time (before or after votingEnd).
+// Token holders lock tokens behind any proposed uint256 price during the
+// voting window. Voters may withdraw their locked tokens at ANY time — both
+// during the active voting period and after voting ends.
 //
 // ────────────────────────────────────────────────────────────────────────────
-// REFLECTION: Handling Withdrawal-Induced Leader Changes
+// REQUIRED CALL ORDER (Settlement Lifecycle)
 // ────────────────────────────────────────────────────────────────────────────
-// In the previous task, weights were monotonic (only increasing), making leader
-// tracking O(1). With mid-voting withdrawals, the leader can be demoted. In an
-// unbounded option space, finding the predecessor cannot be done in O(1) without
-// an expensive on-chain heap.
+// 1. Voting Phase (block.timestamp < votingEnd):
+//    - Voters call `vote(price, amount)` to lock tokens behind a price.
+//    - Voters may call `withdraw(price, amount)` to unlock tokens and remove
+//      their weight from that price before voting ends.
 //
-// Strategy chosen: Deferred Settlement with a Candidate Registry.
-// - vote() and withdraw() update per-price and per-voter balances in O(1).
-// - Each distinct price is added once to `candidatePrices`.
-// - The winning price is computed deterministically upon `finalize()` after
-//   `votingEnd`, ensuring gas-efficient voting and withdrawals.
+// 2. Post-Voting Withdrawal (block.timestamp >= votingEnd):
+//    - Voters may still call `withdraw(price, amount)` at any time to reclaim
+//      their tokens. Because the voting period is over, post-voting withdrawals
+//      do NOT alter `_weights[price]` (weights are frozen at `votingEnd`).
+//
+// 3. Settlement Phase (block.timestamp >= votingEnd):
+//    - If NO votes remain (`totalWeight == 0`), anyone can call `finalize()`
+//      immediately to mark the round finalized with `winningPrice = 0`.
+//    - If votes remain (`totalWeight > 0`):
+//      a) Anyone calls `proposeWinner(price)` with a candidate that has > 0
+//         weight. This opens a challenge window of `CHALLENGE_PERIOD` (1 hour).
+//      b) While `block.timestamp < challengeEnd`, anyone can call
+//         `challenge(challengerPrice)` with a different price that has strictly
+//         greater weight (overtaking the candidate and resetting the challenge
+//         window) or equal weight (marking the top weight as tied).
+//      c) Once `block.timestamp >= challengeEnd`, anyone calls `finalize()` to
+//         lock in `winningPrice` and emit `PriceFinalized`.
+//
+// ────────────────────────────────────────────────────────────────────────────
+// TIE-BREAKING RULE (Documented & Applied Consistently)
+// ────────────────────────────────────────────────────────────────────────────
+// If two or more distinct prices tie for the highest final weight at
+// `votingEnd`, NO winner is declared: `winningPrice` is set to `0` (and
+// `currentTokenPrice()` remains `0`).
+// - If `challenge(price)` presents a distinct price with `weight == candidateWeight`,
+//   `isTied` becomes `true`.
+// - A tie can only be broken if a subsequent `challenge(price)` supplies a
+//   price with strictly higher weight (`weight > candidateWeight`), which sets
+//   `isTied = false` and promotes the new leader.
+// - At `finalize()`, if `isTied == true`, `winningPrice` resolves to `0`.
+//
+// ────────────────────────────────────────────────────────────────────────────
+// REFLECTION: Strategy for Handling Withdrawal-Induced Leader Changes
+// ────────────────────────────────────────────────────────────────────────────
+// In Task 02, leader tracking used an incremental `if (newWeight > leaderWeight)`
+// check on every vote. That breaks as soon as withdrawals are allowed, because
+// withdrawing from the leader can demote it, and finding the new highest-weight
+// price across an unbounded uint256 option space cannot be done in O(1).
+//
+// Even deferring the max-search to a `finalize()` loop over an array of voted
+// prices (or a `withdrawAll()` loop over a voter's price array) creates an
+// unbounded iteration vulnerability: an attacker could spam small votes across
+// thousands of dummy prices to cause out-of-gas DoS during settlement.
+//
+// Solution: Optimistic Claim-and-Challenge Settlement.
+// - `vote` and `withdraw` execute in strict O(1) time with zero loops.
+// - No voter-controlled arrays exist in storage.
+// - After `votingEnd`, anyone proposes the winning price in O(1), challengers
+//   can dispute it in O(1) during `CHALLENGE_PERIOD`, and `finalize()` settles
+//   the outcome in O(1). Every operation has bounded constant gas cost.
 // ============================================================================
 
 contract PriceVotingWithdrawal {
+    uint256 public constant CHALLENGE_PERIOD = 1 hours;
+
     IERC20 private immutable _token;
     uint256 private immutable _votingEnd;
 
-    // Per-price weight and per-voter per-price stake
+    // O(1) bookkeeping: no voter-controlled dynamic arrays anywhere in storage
     mapping(uint256 => uint256) private _weights;
     mapping(address => mapping(uint256 => uint256)) private _votes;
     mapping(address => uint256) private _locked;
+    uint256 private _totalWeight;
 
-    // Registry of unique candidate prices
-    uint256[] private _candidatePrices;
-    mapping(uint256 => bool) private _isCandidate;
+    // Claim-and-challenge settlement state
+    uint256 private _candidatePrice;
+    uint256 private _candidateWeight;
+    bool private _isTied;
+    uint256 private _challengeEnd;
 
-    // History of prices voted on by each user
-    mapping(address => uint256[]) private _voterPrices;
-    mapping(address => mapping(uint256 => bool)) private _hasVotedOnPrice;
-
-    // Finalized state
     uint256 private _winningPrice;
-    uint256 private _winningWeight;
     bool private _finalized;
 
-    // Errors
+    // Custom Errors
     error VotingEnded();
     error VotingActive();
     error AlreadyFinalized();
     error ZeroAmount();
+    error ZeroWeight();
     error InsufficientLockedBalance();
-    error NothingToClaim();
     error TransferFailed();
+    error CandidateAlreadyProposed();
+    error NoCandidateProposed();
+    error ChallengePeriodActive();
+    error ChallengePeriodEnded();
+    error SameCandidate();
+    error InsufficientWeight();
+    error AlreadyTied();
 
     // Events
     event Voted(address indexed voter, uint256 indexed price, uint256 amount);
     event Withdrawn(address indexed voter, uint256 indexed price, uint256 amount);
+    event WinnerProposed(uint256 indexed price, uint256 weight, uint256 challengeEnd);
+    event WinnerChallenged(uint256 indexed challengerPrice, uint256 weight, bool isTied, uint256 challengeEnd);
     event PriceFinalized(uint256 indexed price, uint256 weight);
 
     constructor(IERC20 token_, uint256 votingEnd_) {
@@ -66,9 +120,9 @@ contract PriceVotingWithdrawal {
         _votingEnd = votingEnd_;
     }
 
-    // ─── Mutations ────────────────────────────────────────────
+    // ─── Voting & Withdrawal (Strict O(1)) ────────────────────
 
-    /// @notice Lock tokens behind a proposed price.
+    /// @notice Lock `amount` tokens behind `price` during the active voting period.
     function vote(uint256 price, uint256 amount) external {
         if (block.timestamp >= _votingEnd) {
             revert VotingEnded();
@@ -82,24 +136,17 @@ contract PriceVotingWithdrawal {
             revert TransferFailed();
         }
 
-        if (!_isCandidate[price]) {
-            _isCandidate[price] = true;
-            _candidatePrices.push(price);
-        }
-
-        if (!_hasVotedOnPrice[msg.sender][price]) {
-            _hasVotedOnPrice[msg.sender][price] = true;
-            _voterPrices[msg.sender].push(price);
-        }
-
         _votes[msg.sender][price] += amount;
-        _weights[price] += amount;
         _locked[msg.sender] += amount;
+        _weights[price] += amount;
+        _totalWeight += amount;
 
         emit Voted(msg.sender, price, amount);
     }
 
-    /// @notice Withdraw locked tokens from a price at ANY time (before or after votingEnd).
+    /// @notice Withdraw `amount` tokens locked on `price` at any time (before or after `votingEnd`).
+    /// @dev Follows Checks-Effects-Interactions. Before `votingEnd`, withdrawal also reduces
+    ///      the price's election weight; after `votingEnd`, weights remain frozen.
     function withdraw(uint256 price, uint256 amount) external {
         if (amount == 0) {
             revert ZeroAmount();
@@ -108,10 +155,16 @@ contract PriceVotingWithdrawal {
             revert InsufficientLockedBalance();
         }
 
+        // Effects before interaction (CEI)
         _votes[msg.sender][price] -= amount;
-        _weights[price] -= amount;
         _locked[msg.sender] -= amount;
 
+        if (block.timestamp < _votingEnd) {
+            _weights[price] -= amount;
+            _totalWeight -= amount;
+        }
+
+        // Interaction
         bool ok = _token.transfer(msg.sender, amount);
         if (!ok) {
             revert TransferFailed();
@@ -120,35 +173,74 @@ contract PriceVotingWithdrawal {
         emit Withdrawn(msg.sender, price, amount);
     }
 
-    /// @notice Conveniently withdraw all locked tokens across all prices for msg.sender.
-    function withdrawAll() external {
-        uint256 totalToReturn = 0;
-        uint256[] storage prices = _voterPrices[msg.sender];
+    // ─── Claim-and-Challenge Settlement (Strict O(1)) ─────────
 
-        for (uint256 i = 0; i < prices.length; i++) {
-            uint256 p = prices[i];
-            uint256 stake = _votes[msg.sender][p];
-            if (stake > 0) {
-                _votes[msg.sender][p] = 0;
-                _weights[p] -= stake;
-                totalToReturn += stake;
-                emit Withdrawn(msg.sender, p, stake);
-            }
+    /// @notice Propose the winning price after voting ends to start the challenge window.
+    function proposeWinner(uint256 price) external {
+        if (block.timestamp < _votingEnd) {
+            revert VotingActive();
+        }
+        if (_finalized) {
+            revert AlreadyFinalized();
+        }
+        if (_challengeEnd != 0) {
+            revert CandidateAlreadyProposed();
         }
 
-        if (totalToReturn == 0) {
-            revert NothingToClaim();
+        uint256 weight = _weights[price];
+        if (weight == 0) {
+            revert ZeroWeight();
         }
 
-        _locked[msg.sender] -= totalToReturn;
+        _candidatePrice = price;
+        _candidateWeight = weight;
+        _isTied = false;
+        _challengeEnd = block.timestamp + CHALLENGE_PERIOD;
 
-        bool ok = _token.transfer(msg.sender, totalToReturn);
-        if (!ok) {
-            revert TransferFailed();
-        }
+        emit WinnerProposed(price, weight, _challengeEnd);
     }
 
-    /// @notice Finalize the vote after the voting period ends.
+    /// @notice Challenge the proposed winner with another price having >= weight.
+    /// @dev Strictly higher weight replaces the candidate and clears any tie.
+    ///      Equal weight marks the round as tied per the documented tie-breaking rule.
+    function challenge(uint256 challengerPrice) external {
+        if (_finalized) {
+            revert AlreadyFinalized();
+        }
+        if (_challengeEnd == 0) {
+            revert NoCandidateProposed();
+        }
+        if (block.timestamp >= _challengeEnd) {
+            revert ChallengePeriodEnded();
+        }
+        if (challengerPrice == _candidatePrice) {
+            revert SameCandidate();
+        }
+
+        uint256 challengerWeight = _weights[challengerPrice];
+        if (challengerWeight < _candidateWeight) {
+            revert InsufficientWeight();
+        }
+
+        if (challengerWeight > _candidateWeight) {
+            _candidatePrice = challengerPrice;
+            _candidateWeight = challengerWeight;
+            _isTied = false;
+            _challengeEnd = block.timestamp + CHALLENGE_PERIOD;
+        } else {
+            // Tie at the top weight
+            if (_isTied) {
+                revert AlreadyTied();
+            }
+            _isTied = true;
+            _challengeEnd = block.timestamp + CHALLENGE_PERIOD;
+        }
+
+        emit WinnerChallenged(challengerPrice, challengerWeight, _isTied, _challengeEnd);
+    }
+
+    /// @notice Finalize the winning price after the challenge window closes (or immediately if no votes).
+    /// @dev Applies the tie-breaking rule: if tied or no votes, `winningPrice` remains 0.
     function finalize() external {
         if (block.timestamp < _votingEnd) {
             revert VotingActive();
@@ -157,14 +249,23 @@ contract PriceVotingWithdrawal {
             revert AlreadyFinalized();
         }
 
+        if (_totalWeight == 0) {
+            _finalized = true;
+            return;
+        }
+
+        if (_challengeEnd == 0) {
+            revert NoCandidateProposed();
+        }
+        if (block.timestamp < _challengeEnd) {
+            revert ChallengePeriodActive();
+        }
+
         _finalized = true;
 
-        (uint256 leadPrice, uint256 maxWeight, bool isTie) = _computeLeader();
-
-        if (maxWeight > 0 && !isTie) {
-            _winningPrice = leadPrice;
-            _winningWeight = maxWeight;
-            emit PriceFinalized(leadPrice, maxWeight);
+        if (!_isTied) {
+            _winningPrice = _candidatePrice;
+            emit PriceFinalized(_candidatePrice, _candidateWeight);
         }
     }
 
@@ -190,6 +291,18 @@ contract PriceVotingWithdrawal {
         return _votes[voter][price];
     }
 
+    function totalWeight() external view returns (uint256) {
+        return _totalWeight;
+    }
+
+    function challengeEnd() external view returns (uint256) {
+        return _challengeEnd;
+    }
+
+    function isTied() external view returns (bool) {
+        return _isTied;
+    }
+
     function currentTokenPrice() external view returns (uint256) {
         return _winningPrice;
     }
@@ -202,39 +315,11 @@ contract PriceVotingWithdrawal {
         return _finalized;
     }
 
-    function candidatePricesCount() external view returns (uint256) {
-        return _candidatePrices.length;
-    }
-
+    /// @notice Returns the leading/winning price and weight. Returns (0, weight) when tied.
     function leader() external view returns (uint256 price, uint256 weight) {
         if (_finalized) {
-            return (_winningPrice, _winningWeight);
+            return (_winningPrice, _isTied ? 0 : _candidateWeight);
         }
-        (uint256 leadPrice, uint256 maxWeight, bool isTie) = _computeLeader();
-        if (isTie) {
-            return (0, maxWeight);
-        }
-        return (leadPrice, maxWeight);
-    }
-
-    // ─── Internal Helpers ─────────────────────────────────────
-
-    function _computeLeader()
-        internal
-        view
-        returns (uint256 leadPrice, uint256 maxWeight, bool isTie)
-    {
-        for (uint256 i = 0; i < _candidatePrices.length; i++) {
-            uint256 p = _candidatePrices[i];
-            uint256 w = _weights[p];
-
-            if (w > maxWeight) {
-                maxWeight = w;
-                leadPrice = p;
-                isTie = false;
-            } else if (w > 0 && w == maxWeight) {
-                isTie = true;
-            }
-        }
+        return (_isTied ? 0 : _candidatePrice, _candidateWeight);
     }
 }
